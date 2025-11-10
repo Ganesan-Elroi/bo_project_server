@@ -236,6 +236,8 @@ def main():
         ip_address = os.environ.get('REMOTE_ADDR', '0.0.0.0')
         cust_code = data.get('cust_code')
         report_type= data.get('report_type' , 'SlutReport')
+        
+        log_debug("Report Type --->", report_type)
         # ===== ADD BASE PATH CONFIGURATION =====
         
         ocr_language = 'swe'
@@ -360,8 +362,18 @@ def main():
                 return_json({"success": False, "error": "Template HTML empty"}, 400)
             
             log_debug("[STEP 3] Analyzing template")
+            # template_structure = analyze_template(template_html)
+            # section_names = [s['name'] for s in template_structure['sections']]
+            
+            # NEW: Filter out metadata sections
             template_structure = analyze_template(template_html)
-            section_names = [s['name'] for s in template_structure['sections']]
+            metadata_keywords = ['månadsrapport', 'dagens datum', 'förnamn', 'efternamn', 'personnummer']
+            section_names = [
+                s['name'] for s in template_structure['sections'] 
+                if not any(keyword in s['name'].lower() for keyword in metadata_keywords)
+            ]
+            log_debug(f"[STEP 4] Filtered to {len(section_names)} content sections (removed metadata)")
+
             
             log_debug(f"[STEP 4] Generating AI summaries for {len(section_names)} sections")
             ai_result = generate_section_specific_summaries(
