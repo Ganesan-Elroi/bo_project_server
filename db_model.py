@@ -24,6 +24,7 @@ def get_db_connection():
     username = "js_api_user"
     password = "SecurePassword123!"
 
+
     
     conn = pyodbc.connect(
         f"DRIVER={{{driver}}};"

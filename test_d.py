@@ -2,13 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 POST Method Handler for AI Summary Generation - IIS COMPATIBLE VERSION
-WITH EXTERNAL FILE PROCESSING
+WITH UNMAPPED SECTION HANDLING
 """
 
 import sys
 import os
 import json
 import time
+import re
 from datetime import datetime
 
 # Simple import suppression
@@ -30,7 +31,7 @@ try:
     from db_model import get_db_connection
     from utils.template_analyzer import analyze_template
     from utils.template_mapper import map_bullets_to_template
-    from utils.openai_summarizer_with_template import generate_section_specific_summaries
+    from utils.openai_summarizer_with_template import generate_section_specific_summaries, generate_content_for_unmapped_sections
 except ImportError as e:
     SUCCESSFUL_IMPORTS = False
     IMPORT_ERROR_MSG = str(e)
@@ -204,6 +205,41 @@ def process_single_file(doc, base_path, ocr_language):
         log_debug(f"[FILE_PROCESS] Error processing {doc['name']}: {e}")
         return {'success': False}
 
+
+def find_unmapped_sections(template_sections, mapped_sections):
+    """
+    Find template sections that were not mapped
+    
+    Args:
+        template_sections (list): All template section names
+        mapped_sections (dict): Sections that were successfully mapped
+        
+    Returns:
+        list: Section names that need content
+    """
+    unmapped = []
+    
+    for template_section in template_sections:
+        # Normalize for comparison
+        template_normalized = re.sub(r'\s+', ' ', template_section.lower().strip())
+        
+        # Check if this section was mapped
+        found = False
+        for mapped_section in mapped_sections.keys():
+            mapped_normalized = re.sub(r'\s+', ' ', mapped_section.lower().strip())
+            if template_normalized == mapped_normalized or \
+               template_normalized in mapped_normalized or \
+               mapped_normalized in template_normalized:
+                found = True
+                break
+        
+        if not found:
+            unmapped.append(template_section)
+            log_debug(f"[UNMAPPED_CHECK] Section not mapped: '{template_section}'")
+    
+    return unmapped
+
+
 def main():
     try:
         log_debug("="*70)
@@ -362,43 +398,113 @@ def main():
                 return_json({"success": False, "error": "Template HTML empty"}, 400)
             
             log_debug("[STEP 3] Analyzing template")
-            # template_structure = analyze_template(template_html)
-            # section_names = [s['name'] for s in template_structure['sections']]
-            
-            # NEW: Filter out metadata sections
-            template_structure = analyze_template(template_html)
-            metadata_keywords = ['månadsrapport', 'dagens datum', 'förnamn', 'efternamn', 'personnummer']
-            section_names = [
-                s['name'] for s in template_structure['sections'] 
-                if not any(keyword in s['name'].lower() for keyword in metadata_keywords)
-            ]
-            log_debug(f"[STEP 4] Filtered to {len(section_names)} content sections (removed metadata)")
+            # Route based on report_type
+            if report_type == "Månadsrapport":
+                # Use MONTHLY files
+                from utils.template_analyzer_monthly import analyze_monthly_template
+                from utils.template_mapper_monthly import map_monthly_bullets
+                from utils.openai_summarizer_with_template_monthly import generate_monthly_summaries
+                
+                template_structure = analyze_monthly_template(template_html)
+                section_names = [s['name'] for s in template_structure['sections']]
+                
+                log_debug(f"[STEP 4] Generating MONTHLY summaries for {len(section_names)} sections")
+                ai_result = generate_monthly_summaries(
+                    documents=processed_documents,
+                    section_names=section_names,
+                    model=openai_model,
+                    max_tokens=max_tokens,
+                    ip_address=ip_address,
+                    client_int_doc_ids=client_int_doc_ids,
+                    journal_doc_ids=journal_doc_ids,
+                    internal_doc_id=internal_doc_id,
+                    client_id=client_id,
+                    cust_id=cust_id,
+                    user_id=user_id
+                )
+                
+                section_bullets = ai_result['section_bullets']
+                
+                log_debug("[STEP 5] Mapping bullets to MONTHLY template")
+                filled_template_html = map_monthly_bullets(
+                    template_html=template_html,
+                    section_bullets=section_bullets,
+                    template_structure=template_structure
+                )
 
-            
-            log_debug(f"[STEP 4] Generating AI summaries for {len(section_names)} sections")
-            ai_result = generate_section_specific_summaries(
-                documents=processed_documents,
-                section_names=section_names,
-                model=openai_model,
-                max_tokens=max_tokens,
-                ip_address=ip_address,
-                client_int_doc_ids=client_int_doc_ids,
-                journal_doc_ids=journal_doc_ids,
-                internal_doc_id=internal_doc_id,
-                client_id=client_id,
-                cust_id=cust_id,
-                user_id=user_id,
-                report_type=report_type
-            )
-            
-            section_bullets = ai_result['section_bullets']
-            
-            log_debug("[STEP 5] Mapping bullets to template")
-            filled_template_html = map_bullets_to_template(
-                template_html=template_html,
-                section_bullets_dict=section_bullets,
-                template_structure=template_structure
-            )
+            else:
+                # Use SLUTRAPPORT files
+                from utils.template_analyzer import analyze_template
+                from utils.template_mapper import map_bullets_to_template
+                from utils.openai_summarizer_with_template import generate_section_specific_summaries, generate_content_for_unmapped_sections
+                
+                template_structure = analyze_template(template_html)
+                section_names = [s['name'] for s in template_structure['sections']]
+                
+                log_debug(f"[STEP 4] Generating SLUTRAPPORT summaries for {len(section_names)} sections")
+                ai_result = generate_section_specific_summaries(
+                    documents=processed_documents,
+                    section_names=section_names,
+                    model=openai_model,
+                    max_tokens=max_tokens,
+                    ip_address=ip_address,
+                    client_int_doc_ids=client_int_doc_ids,
+                    journal_doc_ids=journal_doc_ids,
+                    internal_doc_id=internal_doc_id,
+                    client_id=client_id,
+                    cust_id=cust_id,
+                    user_id=user_id,
+                    report_type=report_type
+                )
+                
+                section_bullets = ai_result['section_bullets']
+                
+                # ===== NEW: CHECK FOR UNMAPPED SECTIONS =====
+                log_debug(f"[STEP 4.5] Checking for unmapped sections")
+                unmapped_sections = find_unmapped_sections(section_names, section_bullets)
+                
+                if unmapped_sections:
+                    log_debug(f"[STEP 4.5] Found {len(unmapped_sections)} unmapped sections, generating content...")
+                    
+                    unmapped_result = generate_content_for_unmapped_sections(
+                        unmapped_sections=unmapped_sections,
+                        documents=processed_documents,
+                        model=openai_model,
+                        max_tokens=2000,
+                        ip_address=ip_address,
+                        client_int_doc_ids=client_int_doc_ids,
+                        journal_doc_ids=journal_doc_ids,
+                        internal_doc_id=internal_doc_id,
+                        client_id=client_id,
+                        cust_id=cust_id,
+                        user_id=user_id,
+                        report_type="SLUTRAPPORT"
+                    )
+                    
+                    # Merge unmapped content with original
+                    unmapped_bullets = unmapped_result['section_bullets']
+                    section_bullets.update(unmapped_bullets)
+                    
+                    # Update costs
+                    ai_result['tokens'] += unmapped_result['tokens']
+                    ai_result['input_tokens'] += unmapped_result['input_tokens']
+                    ai_result['output_tokens'] += unmapped_result['output_tokens']
+                    ai_result['time'] += unmapped_result['time']
+                    ai_result['input_cost'] += unmapped_result['input_cost']
+                    ai_result['output_cost'] += unmapped_result['output_cost']
+                    ai_result['total_cost'] += unmapped_result['total_cost']
+                    
+                    log_debug(f"[STEP 4.5] Merged {len(unmapped_bullets)} unmapped sections")
+                else:
+                    log_debug(f"[STEP 4.5] All sections mapped successfully")
+                
+                log_debug("[STEP 5] Mapping bullets to SLUTRAPPORT template")
+                filled_template_html = map_bullets_to_template(
+                    template_html=template_html,
+                    section_bullets_dict=section_bullets,
+                    template_structure=template_structure
+                )
+
             
             response = {
                 "success": True,

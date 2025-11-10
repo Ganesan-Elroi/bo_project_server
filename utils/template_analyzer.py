@@ -1,7 +1,8 @@
 # utils/template_analyzer.py
 """
-Template Analyzer - Works with ANY template structure
-Detects section headers in HTML templates
+Template Analyzer - Swedish Section Detection
+Detects section headers in Swedish HTML templates
+Supports both TABLE-based and TEXT-based templates
 """
 
 from bs4 import BeautifulSoup, NavigableString
@@ -14,158 +15,285 @@ except:
         pass
 
 
-def is_instruction_text(text):
-    """Check if text is instruction (in parentheses)"""
+def normalize_text(text):
+    """Normalize Swedish text for comparison"""
+    if not text:
+        return ""
     text = str(text).strip()
-    return text.startswith('(') and ')' in text
+    text = re.sub(r'\s+', ' ', text)
+    return text
 
 
-def extract_all_potential_sections(template_html):
-    """Extract ALL potential section headers from template"""
-    soup = BeautifulSoup(template_html, 'html.parser')
+def has_instruction_pattern(element):
+    """Check if element contains instruction text like (Sammanställning...)"""
+    text = element.get_text(strip=True) if hasattr(element, 'get_text') else str(element)
+    if text.startswith('(') and 'sammanställning' in text.lower():
+        return True, element
     
-    potential_sections = []
-    seen_texts = set()
+    if hasattr(element, 'next_siblings'):
+        for sibling in list(element.next_siblings)[:3]:
+            if isinstance(sibling, NavigableString):
+                text = str(sibling).strip()
+                if text.startswith('(') and 'sammanställning' in text.lower():
+                    return True, sibling
+            elif hasattr(sibling, 'get_text'):
+                text = sibling.get_text(strip=True)
+                if text.startswith('(') and 'sammanställning' in text.lower():
+                    return True, sibling
     
-    log_debug("[TEMPLATE_ANALYZER] Starting section detection...")
-    
-    # *** ADD THIS BLACKLIST ***
-    blacklist_patterns = [
-        'månadsrapport', 'slutrapport', 'rapport',
-        'dagens datum', 'förnamn', 'efternamn', 'personnummer',
-        '[dagens datum]', '[förnamn]', '[efternamn]', '[personnummer]'
-    ]
-    
-    for element in soup.find_all(string=True):
-        # Skip if parent is script/style
-        if element.parent and element.parent.name in ['script', 'style', 'meta', 'link', 'title']:
-            continue
-        
-        text = str(element).strip()
-        
-        # Skip empty, seen, or instruction text
-        if not text or len(text) < 5 or text in seen_texts:
-            continue
-        
-        if is_instruction_text(text):
-            continue
-        
-        # *** ADD THIS CHECK ***
-        text_lower = text.lower()
-        if any(pattern in text_lower for pattern in blacklist_patterns):
-            log_debug(f"  [SKIP] Blacklisted: '{text}'")
-            continue
-        
-        # *** ADD THIS CHECK ***
-        # Skip if it's just a date or looks like metadata
-        if len(text) <= 15 and (
-            text.replace('-', '').replace('/', '').isdigit() or  # Date like 2025-11-10
-            text.count('-') == 2 or  # Date format
-            text.strip() in ['pageno', ' ']  # Empty or placeholder
-        ):
-            continue
+    return False, None
 
+
+def detect_table_based_sections(soup):
+    """Detect sections in TABLE templates with gray header cells"""
+    sections = []
+    tables = soup.find_all('table')
+    
+    for table in tables:
+        rows = table.find_all('tr')
         
-        # Look for section header patterns
-        is_section_header = False
-        confidence = 'low'
-        parent = element.parent
-        
-        # Pattern 1: Text looks like a section name (short, no periods)
-        word_count = len(text.split())
-        if 2 <= word_count <= 15:
-            # Check if followed by instruction text
-            if parent:
-                next_sibling = parent.find_next_sibling()
-                if next_sibling:
-                    next_text = next_sibling.get_text(strip=True)
-                    if next_text.startswith('('):
-                        is_section_header = True
-                        confidence = 'high'
-        
-        # Pattern 2: Inside span with Times New Roman
-        if parent and parent.name == 'span':
-            parent_style = parent.get('style', '')
-            if 'times new roman' in parent_style.lower():
-                if word_count <= 15 and not text.endswith('.'):
-                    is_section_header = True
-                    confidence = 'medium'
-        
-        # Pattern 3: Specific known section names (Swedish templates)
-        section_keywords = [
-            'känslo', 'beteende', 'utveckling', 'utbildning', 'skola',
-            'familj', 'social', 'relationer', 'hälsa', 'händelser',
-            'behandling', 'aktiviteter', 'mående'
-        ]
-        
-        text_lower = text.lower()
-        if any(keyword in text_lower for keyword in section_keywords):
-            if word_count <= 15:
-                is_section_header = True
-                if confidence == 'low':
-                    confidence = 'medium'
-        
-        if is_section_header:
-            # Find the best parent element for this section
-            insert_element = parent
+        for row in rows:
+            cells = row.find_all('td')
             
-            # Try to find a better parent (span with styling)
-            check_parent = parent
-            for _ in range(3):
-                if check_parent and check_parent.name in ['span', 'div']:
-                    style = check_parent.get('style', '')
-                    if 'font-family' in style.lower() or 'font-size' in style.lower():
-                        insert_element = check_parent
+            for cell in cells:
+                style = cell.get('style', '')
+                
+                # Check for gray background
+                if 'background-color: #cccccc' in style.lower() or 'background-color: rgb(204, 204, 204)' in style.lower():
+                    text = cell.get_text(strip=True)
+                    text = re.sub(r'\s+', ' ', text)
+                    
+                    if text and len(text) < 150:
+                        content_cell = cell.find_next_sibling('td')
+                        
+                        sections.append({
+                            'name': text,
+                            'type': 'table',
+                            'header_element': cell,
+                            'content_element': content_cell,
+                            'confidence': 'high'
+                        })
+    
+    return sections
+
+
+# def detect_text_based_sections(soup):
+#     """Detect sections in TEXT templates - FIXED for strong tags"""
+#     sections = []
+#     seen_names = set()
+    
+#     # Priority 1: <strong> tags (most common for section headers)
+#     for strong_tag in soup.find_all('strong'):
+#         text = strong_tag.get_text(strip=True)
+        
+#         # Skip empty or very short text
+#         if not text or len(text) < 2:
+#             continue
+            
+#         # Skip if it's a placeholder pattern
+#         if text.startswith('[') and text.endswith(']'):
+#             continue
+            
+#         # Skip if already seen
+#         if text in seen_names:
+#             continue
+        
+#         # Valid section header (2-150 characters)
+#         if len(text) < 150:
+#             # Find instruction/placeholder element after the header
+#             instruction_elem = None
+#             current = strong_tag
+            
+#             # Search through next siblings for (AI CONTENT) or (...) or [...]
+#             for sibling in list(strong_tag.next_siblings)[:5]:
+#                 if isinstance(sibling, NavigableString):
+#                     sibling_text = str(sibling).strip()
+#                     if sibling_text.startswith('(') or sibling_text.startswith('['):
+#                         instruction_elem = sibling
+#                         current = sibling
+#                         break
+#                 elif hasattr(sibling, 'get_text'):
+#                     sibling_text = sibling.get_text(strip=True)
+#                     if sibling_text.startswith('(') or sibling_text.startswith('['):
+#                         instruction_elem = sibling
+#                         current = sibling
+#                         break
+#                     elif sibling.name == 'br':
+#                         current = sibling
+#                     else:
+#                         break
+            
+#             sections.append({
+#                 'name': text,
+#                 'type': 'text',
+#                 'header_element': strong_tag,
+#                 'instruction_element': instruction_elem,
+#                 'insert_after': current,
+#                 'confidence': 'high' if instruction_elem else 'medium'
+#             })
+            
+#             seen_names.add(text)
+    
+#     # Priority 2: <font> tags (fallback)
+#     if not sections:
+#         for font_tag in soup.find_all('font'):
+#             face = font_tag.get('face', '')
+#             size = font_tag.get('size', '')
+            
+#             if 'Times New Roman' in face or size == '3':
+#                 text = font_tag.get_text(strip=True)
+                
+#                 # Skip placeholders
+#                 if (text.startswith('[') and text.endswith(']')) or not text:
+#                     continue
+                
+#                 if text and len(text) < 150 and text not in seen_names:
+#                     has_instruction, instruction_elem = has_instruction_pattern(font_tag)
+#                     insert_after = instruction_elem if instruction_elem else font_tag
+                    
+#                     sections.append({
+#                         'name': text,
+#                         'type': 'text',
+#                         'header_element': font_tag,
+#                         'instruction_element': instruction_elem,
+#                         'insert_after': insert_after,
+#                         'confidence': 'high' if has_instruction else 'medium'
+#                     })
+                    
+#                     seen_names.add(text)
+    
+#     # Priority 3: <span> tags (fallback)
+#     if not sections:
+#         for span_tag in soup.find_all('span'):
+#             style = span_tag.get('style', '')
+            
+#             if 'Times New Roman' in style and '12pt' in style:
+#                 text = span_tag.get_text(strip=True)
+                
+#                 # Skip placeholders
+#                 if (text.startswith('[') and text.endswith(']')) or not text:
+#                     continue
+                
+#                 if text and len(text) < 150 and text not in seen_names:
+#                     has_instruction, instruction_elem = has_instruction_pattern(span_tag)
+#                     insert_after = instruction_elem if instruction_elem else span_tag
+                    
+#                     sections.append({
+#                         'name': text,
+#                         'type': 'text',
+#                         'header_element': span_tag,
+#                         'instruction_element': instruction_elem,
+#                         'insert_after': insert_after,
+#                         'confidence': 'high' if has_instruction else 'medium'
+#                     })
+                    
+#                     seen_names.add(text)
+    
+#     return sections
+
+
+def detect_text_based_sections(soup):
+    """Detect sections in TEXT templates - IMPROVED"""
+    sections = []
+    seen_names = set()
+    
+    # Common title words to skip (not real sections)
+    skip_titles = ['slutrapport', 'månadsrapport', 'rapport', 'document']
+    
+    # Priority 1: <strong> tags
+    for strong_tag in soup.find_all('strong'):
+        text = strong_tag.get_text(strip=True)
+        
+        # Skip empty or very short text
+        if not text or len(text) < 2:
+            continue
+        
+        # Skip title text
+        if text.lower() in skip_titles:
+            continue
+        
+        # Skip placeholders
+        if text.startswith('[') and text.endswith(']'):
+            continue
+        
+        # Skip if already seen
+        if text in seen_names:
+            continue
+        
+        # Valid section header (2-150 characters)
+        if len(text) < 150:
+            # Find instruction/placeholder element OUTSIDE the strong tag
+            instruction_elem = None
+            current = strong_tag
+            
+            # Look at SIBLINGS of the strong tag, not children
+            for sibling in list(strong_tag.next_siblings)[:10]:
+                if isinstance(sibling, NavigableString):
+                    sibling_text = str(sibling).strip()
+                    if sibling_text and (sibling_text.startswith('(') or sibling_text.startswith('[')):
+                        instruction_elem = sibling
+                        current = sibling
                         break
-                check_parent = check_parent.parent if check_parent else None
+                elif hasattr(sibling, 'get_text'):
+                    sibling_text = sibling.get_text(strip=True)
+                    if sibling_text and (sibling_text.startswith('(') or sibling_text.startswith('[')):
+                        instruction_elem = sibling
+                        current = sibling
+                        break
+                    elif sibling.name == 'br':
+                        current = sibling
+                    elif sibling.name == 'div':
+                        # Check if div contains placeholder
+                        div_text = sibling.get_text(strip=True)
+                        if div_text.startswith('(') or div_text.startswith('['):
+                            instruction_elem = sibling
+                            current = sibling
+                            break
+                        else:
+                            break
+                    else:
+                        break
             
-            potential_sections.append({
+            sections.append({
                 'name': text,
-                'confidence': confidence,
-                'element': insert_element or parent,
-                'type': 'text_section'
+                'type': 'text',
+                'header_element': strong_tag,
+                'instruction_element': instruction_elem,
+                'insert_after': current,
+                'confidence': 'high' if instruction_elem else 'medium'
             })
-            seen_texts.add(text)
-            log_debug(f"  [SECTION] Found: '{text[:50]}' (confidence: {confidence})")
+            
+            seen_names.add(text)
     
-    # Also check for bold/strong sections
-    for tag in soup.find_all(['b', 'strong']):
-        text = tag.get_text(strip=True)
-        if text and 5 < len(text) < 100 and text not in seen_texts:
-            if not is_instruction_text(text):
-                potential_sections.append({
-                    'name': text,
-                    'confidence': 'high',
-                    'element': tag,
-                    'type': 'bold_section'
-                })
-                seen_texts.add(text)
-                log_debug(f"  [BOLD] Found: '{text[:50]}'")
+    # Priority 2: <font> tags (fallback)
+    if not sections:
+        for font_tag in soup.find_all('font'):
+            face = font_tag.get('face', '')
+            size = font_tag.get('size', '')
+            
+            if 'Times New Roman' in face or size == '3':
+                text = font_tag.get_text(strip=True)
+                
+                # Skip placeholders and titles
+                if (text.startswith('[') and text.endswith(']')) or not text or text.lower() in skip_titles:
+                    continue
+                
+                if text and len(text) < 150 and text not in seen_names:
+                    has_instruction, instruction_elem = has_instruction_pattern(font_tag)
+                    insert_after = instruction_elem if instruction_elem else font_tag
+                    
+                    sections.append({
+                        'name': text,
+                        'type': 'text',
+                        'header_element': font_tag,
+                        'instruction_element': instruction_elem,
+                        'insert_after': insert_after,
+                        'confidence': 'high' if has_instruction else 'medium'
+                    })
+                    
+                    seen_names.add(text)
     
-    # Check for table headers
-    for td in soup.find_all('td'):
-        style = td.get('style', '').lower()
-        if 'background-color: #cccccc' in style or 'background-color: rgb(204, 204, 204)' in style:
-            text = td.get_text(strip=True)
-            if text and text not in seen_texts and not is_instruction_text(text):
-                potential_sections.append({
-                    'name': text,
-                    'confidence': 'high',
-                    'element': td,
-                    'content_element': td.find_next_sibling('td'),
-                    'type': 'table_header'
-                })
-                seen_texts.add(text)
-                log_debug(f"  [TABLE] Found: '{text[:50]}'")
-    
-    log_debug(f"[TEMPLATE_ANALYZER] Total sections found: {len(potential_sections)}")
-    
-    # Sort by confidence
-    high_conf = [s for s in potential_sections if s['confidence'] == 'high']
-    medium_conf = [s for s in potential_sections if s['confidence'] == 'medium']
-    low_conf = [s for s in potential_sections if s['confidence'] == 'low']
-    
-    return high_conf + medium_conf + low_conf
+    return sections
 
 
 def analyze_template(template_html):
@@ -181,20 +309,22 @@ def analyze_template(template_html):
         }
     """
     soup = BeautifulSoup(template_html, 'html.parser')
-    sections = extract_all_potential_sections(template_html)
     
-    # Determine template type
-    table_sections = [s for s in sections if s['type'] == 'table_header']
-    text_sections = [s for s in sections if s['type'] != 'table_header']
+    table_sections = detect_table_based_sections(soup)
+    text_sections = detect_text_based_sections(soup)
     
     if table_sections and not text_sections:
         template_type = 'table'
+        sections = table_sections
     elif text_sections and not table_sections:
         template_type = 'text'
+        sections = text_sections
     elif table_sections and text_sections:
         template_type = 'mixed'
+        sections = table_sections + text_sections
     else:
         template_type = 'unknown'
+        sections = []
     
     return {
         'sections': sections,
