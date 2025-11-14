@@ -1,7 +1,8 @@
 # openai_summarizer_bullets.py
 """
-OpenAI Summarizer - Bullet Points Mode - IIS Compatible Version
-Generates bullet point summaries without templates
+OpenAI Summarizer - Bullet Points Mode with Dynamic Headers
+Generates organized summaries with AI-generated section headers
+Used when NO template is provided
 """
 
 from openai import OpenAI
@@ -12,7 +13,6 @@ from db_model import model_pricing, log_to_database
 from utils.config import Config
 
 conf = Config()
-
 
 try:
     from save_logs import log_debug
@@ -25,11 +25,18 @@ except:
 # Initialize OpenAI client
 client = OpenAI(api_key=conf.OPENAI_API_KEY)
 
+
 def process_documents_bullets(documents, chunk_size=5, ip_address=None, model='gpt-4o-mini', 
                               max_tokens=4000, client_int_doc_ids=None, journal_doc_ids=None, 
-                              internal_doc_id=None, client_id=0, cust_id=0, user_id=0):
+                              internal_doc_id=None, client_id=0, cust_id=0, user_id=0, report_type=None):
     """
-    Process documents and generate bullet point summaries
+    Process diverse/unpredictable documents and generate organized summaries with dynamic headers
+    
+    This function is called when NO template is provided. The AI will:
+    1. Analyze document content
+    2. Identify main themes/topics
+    3. Create appropriate section headers
+    4. Organize bullets under those headers
     
     Args:
         documents (list): List of processed documents
@@ -45,77 +52,96 @@ def process_documents_bullets(documents, chunk_size=5, ip_address=None, model='g
         user_id (int): User ID
         
     Returns:
-        dict: Results with bullet summaries and metadata
+        dict: Results with organized sections (headers + bullets) and metadata
     """
     language = 'svenska'
     
-    log_debug(f"[BULLET_SUMMARIZER] Processing {len(documents)} documents")
-    log_debug(f"[BULLET_SUMMARIZER] Model: {model}, Chunk size: {chunk_size}")
+    log_debug(f"[BULLET_SUMMARIZER] Processing {len(documents)} documents (NO TEMPLATE MODE)")
+    log_debug(f"[BULLET_SUMMARIZER] Model: {model}, Max tokens: {max_tokens}")
     
     if not documents:
         log_debug("[BULLET_SUMMARIZER] [WARNING] No documents to process")
         return {
             'status': 'error',
             'error': 'No documents to process',
-            'bullet_summaries': []
+            'organized_summary': [],
+            'html_output': ''
         }
     
     # Build document context
     doc_context = ""
     for idx, doc in enumerate(documents, 1):
         doc_name = doc.get('name', f'Document {idx}')
-        doc_text = doc.get('text', '')[:8000]  # Limit per doc
+        doc_text = doc.get('text', '')[:8000]  # Limit per doc to stay within token limits
         word_count = doc.get('text_info', {}).get('word_count', 0)
+        created_date = doc.get('created_date', 'Unknown date')
         
         doc_context += f"\n{'='*60}\n"
-        doc_context += f"Document {idx}: {doc_name} ({word_count} words)\n"
+        doc_context += f"Document {idx}: {doc_name}\n"
+        doc_context += f"Date: {created_date} | Words: {word_count}\n"
         doc_context += f"{'='*60}\n"
         doc_context += f"{doc_text}\n\n"
     
-    prompt = f"""You are analyzing multiple documents to create a comprehensive summary.
+    # Prompt for AI to create dynamic headers and organized content
+    prompt = f"""You are analyzing diverse documents to create a well-organized summary report in {language}.
 
 DOCUMENTS:
 {doc_context}
 
 TASK:
-Create a well-organized bullet point summary of ALL the documents above in {language}.
+Analyze ALL documents and create an organized summary with appropriate section headers based on the actual content.
 
 INSTRUCTIONS:
-1. Create 10-20 comprehensive bullet points covering ALL documents
-2. Organize bullets by themes or topics
-3. Each bullet should be 15-40 words
+1. Identify the 4-8 most important themes/topics across ALL documents
+2. Create a descriptive Swedish section header for each theme (e.g., "HÄLSA OCH VÅRD", "UTBILDNING", "BETEENDE OCH UTVECKLING", "SOCIALA RELATIONER")
+3. Under each header, provide 3-8 bullet points (15-40 words each)
 4. Include specific dates, names, facts, and important details
-5. Highlight dates by wrapping them in {{{{HIGHLIGHT}}}}date{{{{/HIGHLIGHT}}}}
+5. Highlight dates by wrapping them: {{{{HIGHLIGHT}}}}date{{{{/HIGHLIGHT}}}}
 6. Combine related information from multiple documents
-7. Focus on key facts, decisions, actions, and outcomes
+7. Use professional svenska
+8. Section headers should be in ALL CAPS and descriptive
 
 RETURN FORMAT (JSON):
 {{
-  "summary_bullets": [
-    "Bullet point 1 with important information",
-    "Bullet point 2 with key details and dates",
-    ...
+  "sections": [
+    {{
+      "header": "DESCRIPTIVE SECTION NAME IN CAPS",
+      "bullets": [
+        "Bullet point 1 with specific details and facts",
+        "Bullet point 2 with dates and information",
+        "Bullet point 3..."
+      ]
+    }},
+    {{
+      "header": "ANOTHER RELEVANT SECTION",
+      "bullets": [
+        "Bullet point 1",
+        "Bullet point 2"
+      ]
+    }}
   ]
 }}
 
-Remember:
-- Combine information from ALL documents
-- Focus on facts and specific details
-- Use clear, professional svenska
-- 10-20 bullets total
+**CRITICAL REQUIREMENTS**:
+- Create 4-8 sections based on actual document content
+- Headers should reflect the ACTUAL topics found in the documents
+- Each section must have 3-8 substantive bullet points
+- All content must be in svenska
+- Include ALL important information from the documents
+- Do not create empty or generic sections
 """
 
     try:
         start_time = time.time()
         
-        log_debug("[BULLET_SUMMARIZER] Calling OpenAI API...")
+        log_debug("[BULLET_SUMMARIZER] Calling OpenAI API for dynamic header generation...")
         
         response = client.chat.completions.create(
             model=model,
             messages=[
                 {
                     "role": "system",
-                    "content": f"You are an expert at analyzing documents and creating comprehensive summaries in svenska."
+                    "content": f"You are an expert at analyzing diverse documents and creating well-organized summaries with appropriate section headers in {language}. You identify key themes and organize information logically."
                 },
                 {"role": "user", "content": prompt}
             ],
@@ -127,15 +153,23 @@ Remember:
         elapsed = time.time() - start_time
         content = response.choices[0].message.content.strip()
         
-        # Parse JSON
+        # Parse JSON response
         result = json.loads(content)
-        bullets = result.get('summary_bullets', [])
+        sections = result.get('sections', [])
         
-        # Calculate stats
+        # Calculate statistics
+        total_bullets = sum(len(section.get('bullets', [])) for section in sections)
         usage = response.usage
         
         log_debug(f"[BULLET_SUMMARIZER] [SUCCESS] Generated in {elapsed:.1f}s")
-        log_debug(f"[BULLET_SUMMARIZER] [STATS] Tokens: {usage.total_tokens} | Bullets: {len(bullets)}")
+        log_debug(f"[BULLET_SUMMARIZER] [STATS] Sections: {len(sections)} | Total bullets: {total_bullets}")
+        log_debug(f"[BULLET_SUMMARIZER] [STATS] Tokens: {usage.total_tokens}")
+        
+        # Log section headers
+        for section in sections:
+            header = section.get('header', 'Unknown')
+            bullet_count = len(section.get('bullets', []))
+            log_debug(f"[BULLET_SUMMARIZER]   - {header}: {bullet_count} bullets")
         
         # Calculate costs
         INPUT_COST_PER_1M = 0.15
@@ -145,7 +179,7 @@ Remember:
         output_cost = (usage.completion_tokens / 1_000_000) * OUTPUT_COST_PER_1M
         total_cost = input_cost + output_cost
         
-        # Pricing for model
+        # Adjust pricing for different models
         if model not in ["gpt-4o-mini"]:
             pricing = model_pricing(model)
             if pricing:
@@ -154,6 +188,9 @@ Remember:
                 total_cost = input_cost + output_cost
         
         log_debug(f"[BULLET_SUMMARIZER] [COST] Input: ${input_cost:.6f}, Output: ${output_cost:.6f}, Total: ${total_cost:.6f}")
+        
+        # Generate HTML output
+        html_output = generate_html_from_sections(sections)
         
         # Log to database
         log_data = {
@@ -173,14 +210,18 @@ Remember:
             'processing_time': elapsed,
             'chrClientIntDocIds': client_int_doc_ids,
             'chrJournalDocIds': journal_doc_ids,
-            'intInternalDocId': internal_doc_id
+            'intInternalDocId': internal_doc_id,
+            'chrReportType': report_type
         }
         log_to_database(log_data)
         log_debug("[BULLET_SUMMARIZER] Database logging completed")
         
         return {
             'status': 'success',
-            'bullet_summaries': bullets,
+            'organized_summary': sections,  # Structured sections with headers
+            'html_output': html_output,     # Ready-to-use HTML
+            'section_count': len(sections),
+            'bullet_count': total_bullets,
             'tokens': usage.total_tokens,
             'input_tokens': usage.prompt_tokens,
             'output_tokens': usage.completion_tokens,
@@ -188,6 +229,16 @@ Remember:
             'input_cost': round(input_cost, 6),
             'output_cost': round(output_cost, 6),
             'total_cost': round(total_cost, 6)
+        }
+        
+    except json.JSONDecodeError as e:
+        log_debug(f"[BULLET_SUMMARIZER] [ERROR] JSON parsing error: {e}")
+        log_debug(f"[BULLET_SUMMARIZER] [ERROR] Raw response: {content[:500]}")
+        return {
+            'status': 'error',
+            'error': f'Failed to parse AI response: {str(e)}',
+            'organized_summary': [],
+            'html_output': ''
         }
         
     except Exception as e:
@@ -198,9 +249,53 @@ Remember:
         return {
             'status': 'error',
             'error': str(e),
-            'bullet_summaries': [],
+            'organized_summary': [],
+            'html_output': '',
             'tokens': 0,
             'input_tokens': 0,
             'output_tokens': 0,
             'time': 0
         }
+
+
+def generate_html_from_sections(sections):
+    """
+    Generate formatted HTML from sections with headers and bullets
+    
+    Args:
+        sections (list): List of section dictionaries with 'header' and 'bullets'
+        
+    Returns:
+        str: Formatted HTML string
+    """
+    html_parts = []
+    
+    html_parts.append('<div style="font-family: Verdana, Arial, sans-serif; max-width: 800px; margin: 20px;">')
+    
+    for section in sections:
+        header = section.get('header', 'UNKNOWN SECTION')
+        bullets = section.get('bullets', [])
+        
+        if not bullets:
+            continue
+        
+        # Section header
+        html_parts.append(f'<div style="margin-top: 25px; margin-bottom: 10px;">')
+        html_parts.append(f'<strong style="font-size: 11pt;">{header}</strong>')
+        html_parts.append('</div>')
+        
+        # Bullet list
+        html_parts.append('<ul style="list-style-type: disc; padding-left: 25px; line-height: 1.8; margin: 10px 0;">')
+        
+        for bullet in bullets:
+            # Handle date highlighting
+            bullet_html = str(bullet).replace('{{HIGHLIGHT}}', '<span style="background-color: #fbbf24; padding: 2px 6px; border-radius: 3px;">')
+            bullet_html = bullet_html.replace('{{/HIGHLIGHT}}', '</span>')
+            
+            html_parts.append(f'<li style="margin-bottom: 8px;">{bullet_html}</li>')
+        
+        html_parts.append('</ul>')
+    
+    html_parts.append('</div>')
+    
+    return '\n'.join(html_parts)

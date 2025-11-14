@@ -65,65 +65,61 @@ def model_pricing(model_name: str):
 	
 
 def log_to_database(log_data):
-	try:
-		conn = get_db_connection()
-		cursor = conn.cursor()
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
 
-		# Prepare SQL insert
-		sql = """
-		INSERT INTO tblAiLogs (
-			intCid,
-			intUserId,
-			intClientId,
-			intDocCount,
-			intPromptToken,
-			intOutputToken,
-			intTotalToken,
-			chrModelName,
-			intAPICalls,
-			InputCost,
-			OutputCost,
-			TotalCost,
-			IPAddress,
-			ProcessingTime,
-			dtCreatedDate,
-			chrClientIntDocIds,
-			chrJournalDocIds,
-			intInternalDocId
-			
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,?,?)
-		"""
-		
-		# Prepare values
-		values = (
-			log_data.get('cid', 0),
-			log_data.get('user_id', 0),
-			log_data.get('client_id', 0),
-			log_data.get('document_count', 0),
-			log_data.get('prompt_tokens', 0),
-			log_data.get('completion_tokens', 0),
-			log_data.get('total_tokens', 0),
-			log_data.get('model', ''),
-			log_data.get('api_calls', 0),
-			log_data.get('input_cost', 0.0),
-			log_data.get('output_cost', 0.0),
-			log_data.get('total_cost', 0.0),
-			log_data.get('ip_address', ''),
-			log_data.get('processing_time', 0.0),
-			datetime.now(),
-			
-			log_data.get('chrClientIntDocIds', ''),
-			log_data.get('chrJournalDocIds', ''),
-			log_data.get('intInternalDocId', ''),
-			
-		)
-		
-		# Execute insert
-		cursor.execute(sql, values)
-		conn.commit() 
-		cursor.close()
-		conn.close()
-		
-	except Exception as e: 
-		import traceback
-		traceback.print_exc()
+        sql = """
+        INSERT INTO tblAiLogs (
+            intCid,
+            intUserId,
+            intClientId,
+            intDocCount,
+            intPromptToken,
+            intOutputToken,
+            intTotalToken,
+            chrModelName,
+            intAPICalls,
+            InputCost,
+            OutputCost,
+            TotalCost,
+            IPAddress,
+            ProcessingTime,
+            dtCreatedDate,
+            chrClientIntDocIds,
+            chrJournalDocIds,
+            intInternalDocId,
+            chrReportType
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+
+        values = (
+            log_data.get('cid', 0),
+            log_data.get('user_id', 0),
+            log_data.get('client_id', 0),
+            log_data.get('document_count', 0),
+            log_data.get('prompt_tokens', 0),
+            log_data.get('completion_tokens', 0),
+            log_data.get('total_tokens', 0),
+            log_data.get('model', ''),
+            log_data.get('api_calls', 0),
+            log_data.get('input_cost', 0.0),
+            log_data.get('output_cost', 0.0),
+            log_data.get('total_cost', 0.0),
+            log_data.get('ip_address', ''),
+            log_data.get('processing_time', 0.0),
+            datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            log_data.get('chrClientIntDocIds', ''),
+            log_data.get('chrJournalDocIds', ''),
+            log_data.get('intInternalDocId', None),   # FIXED
+            log_data.get('chrReportType', '')
+        )
+
+        cursor.execute(sql, values)
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()

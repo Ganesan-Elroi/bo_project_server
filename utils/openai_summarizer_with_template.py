@@ -22,7 +22,7 @@ client = OpenAI(api_key=conf.OPENAI_API_KEY)
 def generate_content_for_unmapped_sections(unmapped_sections, documents, model, max_tokens=2000,
                                            ip_address=None, client_int_doc_ids=None, journal_doc_ids=None,
                                            internal_doc_id=None, client_id=0, cust_id=0, user_id=0,
-                                           report_type="SLUTRAPPORT"):
+                                           report_type=None):
     """
     Generate content specifically for template sections that weren't mapped in the first pass
     
@@ -58,37 +58,34 @@ def generate_content_for_unmapped_sections(unmapped_sections, documents, model, 
     # Build sections list for prompt
     sections_list = "\n".join([f"- {name}" for name in unmapped_sections])
     
-    prompt = f"""You are analyzing documents to create summaries for specific sections that were not covered in a previous analysis.
+    prompt = f"""You are analyzing documents to create summaries for specific sections.
 
-DOCUMENTS:
-{doc_context}
+        DOCUMENTS:
+        {doc_context}
 
-TEMPLATE SECTIONS TO FILL (USE THESE EXACT NAMES AS JSON KEYS):
-{sections_list}
+        TEMPLATE SECTIONS TO FILL (USE THESE EXACT NAMES AS JSON KEYS):
+        {sections_list}
 
-TASK:
-For EACH section listed above, extract and summarize relevant information from the documents.
-Provide all summaries in {language}.
+        **YOU MUST FILL ALL {len(unmapped_sections)} SECTIONS ABOVE.**
 
-INSTRUCTIONS:
-1. Create 3-8 bullet points per section (10-30 words each)
-2. Include specific dates, names, and facts from the documents
-3. Highlight dates: {{{{HIGHLIGHT}}}}date{{{{/HIGHLIGHT}}}}
-4. **CRITICAL**: If no relevant information exists for a section, write "Information saknas" as a single bullet
-5. Use EXACT section names from the list above as JSON keys
-6. Focus on extracting information that fits each section's topic
+        TASK:
+        For EACH section, create professional summaries based on the documents.
 
-RETURN JSON FORMAT:
-{{
-  "Section Name 1": ["bullet 1", "bullet 2", ...],
-  "Section Name 2": ["bullet 1", "bullet 2", ...]
-}}
+        INSTRUCTIONS:
+        1. Create 3-8 bullet points per section (10-30 words each)
+        2. Extract any relevant or related information from the documents
+        3. If direct information is sparse, use contextual information
+        4. Highlight dates: {{{{HIGHLIGHT}}}}date{{{{/HIGHLIGHT}}}}
+        5. **ONLY use "Information saknas i dokumenten" if absolutely no related content exists**
+        6. Use EXACT section names as JSON keys
 
-**IMPORTANT**: 
-- Include ALL sections from the list (use "Information saknas" if no content found)
-- Use EXACT section names as keys (copy-paste from the list)
-- Write in professional svenska
-"""
+        RETURN JSON WITH ALL {len(unmapped_sections)} SECTIONS:
+        {{
+        "Section Name 1": ["bullet 1", "bullet 2", ...],
+        "Section Name 2": ["bullet 1", "bullet 2", ...]
+        }}
+        """
+
 
     try:
         start_time = time.time()
@@ -159,7 +156,8 @@ RETURN JSON FORMAT:
             'processing_time': elapsed,
             'chrClientIntDocIds': client_int_doc_ids,
             'chrJournalDocIds': journal_doc_ids,
-            'intInternalDocId': internal_doc_id
+            'intInternalDocId': internal_doc_id,
+            'chrReportType': report_type
         }
         log_to_database(log_data)
         log_debug(f"[UNMAPPED] Database logging completed")
@@ -222,27 +220,27 @@ def generate_section_specific_summaries(documents, section_names, model, max_tok
         return generate_monthly_report_summaries(
             documents, section_names, model, max_tokens, ip_address,
             client_int_doc_ids, journal_doc_ids, internal_doc_id,
-            client_id, cust_id, user_id
+            client_id, cust_id, user_id, report_type
         )
     else:
         # Default: Slutrapport (existing functionality)
         return generate_slutrapport_summaries(
             documents, section_names, model, max_tokens, ip_address,
             client_int_doc_ids, journal_doc_ids, internal_doc_id,
-            client_id, cust_id, user_id
+            client_id, cust_id, user_id, report_type
         )
 
 
 def generate_slutrapport_summaries(documents, section_names, model, max_tokens=4000, ip_address=None,
                                    client_int_doc_ids=None, journal_doc_ids=None, internal_doc_id=None,
-                                   client_id=0, cust_id=0, user_id=0):
+                                   client_id=0, cust_id=0, user_id=0, report_type=None):
     """
     Generate summaries for Slutrapport (Final Report)
     Original functionality - unchanged
     """
     language = 'svenska'
     
-    log_debug(f"[SUMMARIZER] [SLUTRAPPORT] Generating AI summaries for {len(section_names)} sections")
+    log_debug(f"[SUMMARIZER] [Slutrapport] Generating AI summaries for {len(section_names)} sections")
     log_debug(f"[SUMMARIZER] Model: {model}, Max tokens: {max_tokens}")
     
     # Build document context
@@ -260,62 +258,97 @@ def generate_slutrapport_summaries(documents, section_names, model, max_tokens=4
     # Build sections list for prompt
     sections_list = "\n".join([f"- {name}" for name in section_names])
     
+#     prompt = f"""You are analyzing multiple documents to create a combined summary report.
+
+# DOCUMENTS:
+# {doc_context}
+
+# TEMPLATE SECTIONS (USE THESE EXACT NAMES AS JSON KEYS):
+# {sections_list}
+
+# TASK:
+# For EACH section above, extract and summarize relevant information from ALL documents.
+# Provide all summaries in {language}.
+
+# INSTRUCTIONS:
+# 1. Create 5-10 comprehensive bullet points per section
+# 2. Combine information from all documents into each section
+# 3. Each bullet should be 10-30 words
+# 4. Include specific dates, names, facts
+# 5. **CRITICAL**: If no relevant information exists for a section, DO NOT include that section in the JSON response at all (omit it completely)
+# 6. Highlight dates by wrapping them in {{{{HIGHLIGHT}}}}date{{{{/HIGHLIGHT}}}}
+
+# CRITICAL: Use the EXACT section names from the list above as JSON keys (copy them exactly, including Swedish characters).
+
+# RETURN FORMAT (JSON):
+# {{
+#   "Section Name 1": [
+#     "Bullet point 1 with details from documents",
+#     "Bullet point 2 combining info from multiple docs",
+#     ...
+#   ],
+#   "Section Name 2": [
+#     "Bullet point 1",
+#     ...
+#   ]
+# }}
+
+# **IMPORTANT**: Only include sections that have actual content from the documents. If a section has no relevant information, completely omit it from the JSON (don't include the key at all).
+
+# Remember:
+# - Use EXACT section names as keys (copy-paste from the list above)
+# - Combine ALL documents into each section
+# - Focus on facts and specific details
+# - Use clear, professional svenska
+# - 5-10 bullets per section (more if section is complex)
+# - **OMIT sections with no relevant information - don't include them in JSON at all**
+# """
+
     prompt = f"""You are analyzing multiple documents to create a combined summary report.
 
-DOCUMENTS:
-{doc_context}
+        DOCUMENTS:
+        {doc_context}
 
-TEMPLATE SECTIONS (USE THESE EXACT NAMES AS JSON KEYS):
-{sections_list}
+        TEMPLATE SECTIONS (USE THESE EXACT NAMES AS JSON KEYS):
+        {sections_list}
 
-TASK:
-For EACH section above, extract and summarize relevant information from ALL documents.
-Provide all summaries in {language}.
+        **CRITICAL REQUIREMENT**: You MUST return JSON with ALL {len(section_names)} sections listed above.
 
-INSTRUCTIONS:
-1. Create 5-10 comprehensive bullet points per section
-2. Combine information from all documents into each section
-3. Each bullet should be 10-30 words
-4. Include specific dates, names, facts
-5. **CRITICAL**: If no relevant information exists for a section, DO NOT include that section in the JSON response at all (omit it completely)
-6. Highlight dates by wrapping them in {{{{HIGHLIGHT}}}}date{{{{/HIGHLIGHT}}}}
+        TASK:
+        For EACH section above, extract and summarize relevant information from ALL documents.
 
-CRITICAL: Use the EXACT section names from the list above as JSON keys (copy them exactly, including Swedish characters).
+        INSTRUCTIONS:
+        1. Create 3-8 comprehensive bullet points per section
+        2. Each bullet should be 10-30 words
+        3. Include specific dates, names, facts where available
+        4. For sections with limited direct information:
+        - Extract related/contextual information from the documents
+        - Infer relevant content from the overall context
+        - Create brief professional summaries
+        5. Highlight dates: {{{{HIGHLIGHT}}}}date{{{{/HIGHLIGHT}}}}
+        6. Use EXACT section names as JSON keys
 
-RETURN FORMAT (JSON):
-{{
-  "Section Name 1": [
-    "Bullet point 1 with details from documents",
-    "Bullet point 2 combining info from multiple docs",
-    ...
-  ],
-  "Section Name 2": [
-    "Bullet point 1",
-    ...
-  ]
-}}
+        **DO NOT OMIT ANY SECTION** - if truly no information exists, include the section with ["Information saknas i dokumenten"]
 
-**IMPORTANT**: Only include sections that have actual content from the documents. If a section has no relevant information, completely omit it from the JSON (don't include the key at all).
+        RETURN FORMAT (JSON) - MUST INCLUDE ALL {len(section_names)} SECTIONS:
+        {{
+        "Section Name 1": ["bullet 1", "bullet 2", ...],
+        "Section Name 2": ["bullet 1", "bullet 2", ...]
+        }}
+    """
 
-Remember:
-- Use EXACT section names as keys (copy-paste from the list above)
-- Combine ALL documents into each section
-- Focus on facts and specific details
-- Use clear, professional svenska
-- 5-10 bullets per section (more if section is complex)
-- **OMIT sections with no relevant information - don't include them in JSON at all**
-"""
+
 
     return _execute_openai_request(
         prompt, model, max_tokens, section_names, documents, language,
         ip_address, client_int_doc_ids, journal_doc_ids, internal_doc_id,
-        client_id, cust_id, user_id, "SLUTRAPPORT"
+        client_id, cust_id, user_id, report_type
     )
 
 
 def generate_monthly_report_summaries(documents, section_names, model, max_tokens=4000, ip_address=None,
                                       client_int_doc_ids=None, journal_doc_ids=None, internal_doc_id=None,
-                                      client_id=0, cust_id=0, user_id=0):
+                                      client_id=0, cust_id=0, user_id=0, report_type=None):
     """
     Generate summaries for Monthly Report (Månadsrapport)
     Handles journal entries with merged JournalText + CorrectedText
@@ -374,14 +407,14 @@ RETURN JSON FORMAT:
 
 def _execute_openai_request(prompt, model, max_tokens, section_names, documents, language,
                             ip_address, client_int_doc_ids, journal_doc_ids, internal_doc_id,
-                            client_id, cust_id, user_id, report_label):
+                            client_id, cust_id, user_id, report_type):
     """
     Common function to execute OpenAI request and process response
     """
     try:
         start_time = time.time()
         
-        log_debug(f"[SUMMARIZER] [{report_label}] Calling OpenAI API...")
+        log_debug(f"[SUMMARIZER] [{report_type}] Calling OpenAI API...")
         
         response = client.chat.completions.create(
             model=model,
@@ -412,7 +445,7 @@ def _execute_openai_request(prompt, model, max_tokens, section_names, documents,
         for section_name, bullets in section_bullets.items():
             # Check if bullets list is empty
             if not bullets:
-                log_debug(f"[SUMMARIZER] [{report_label}] Filtering out '{section_name}': empty bullets list")
+                log_debug(f"[SUMMARIZER] [{report_type}] Filtering out '{section_name}': empty bullets list")
                 continue
             
             # Check if bullets contain only whitespace or placeholder text
@@ -426,7 +459,7 @@ def _execute_openai_request(prompt, model, max_tokens, section_names, documents,
             if has_real_content:
                 filtered_bullets[section_name] = bullets
             else:
-                log_debug(f"[SUMMARIZER] [{report_label}] Filtering out '{section_name}': only placeholder content")
+                log_debug(f"[SUMMARIZER] [{report_type}] Filtering out '{section_name}': only placeholder content")
         
         # Use filtered bullets instead
         section_bullets = filtered_bullets
@@ -435,9 +468,9 @@ def _execute_openai_request(prompt, model, max_tokens, section_names, documents,
         usage = response.usage
         total_bullets = sum(len(bullets) for bullets in section_bullets.values())
         
-        log_debug(f"[SUMMARIZER] [{report_label}] [SUCCESS] Generated in {elapsed:.1f}s")
-        log_debug(f"[SUMMARIZER] [{report_label}] [STATS] Tokens: {usage.total_tokens} | Bullets: {total_bullets}")
-        log_debug(f"[SUMMARIZER] [{report_label}] [STATS] Sections with content: {len(section_bullets)}/{len(section_names)}")
+        log_debug(f"[SUMMARIZER] [{report_type}] [SUCCESS] Generated in {elapsed:.1f}s")
+        log_debug(f"[SUMMARIZER] [{report_type}] [STATS] Tokens: {usage.total_tokens} | Bullets: {total_bullets}")
+        log_debug(f"[SUMMARIZER] [{report_type}] [STATS] Sections with content: {len(section_bullets)}/{len(section_names)}")
         
         # Calculate costs
         INPUT_COST_PER_1M = 0.15
@@ -455,7 +488,7 @@ def _execute_openai_request(prompt, model, max_tokens, section_names, documents,
                 output_cost = (usage.completion_tokens / 1_000_000) * pricing["outputCostPerM"]
                 total_cost = input_cost + output_cost
         
-        log_debug(f"[SUMMARIZER] [{report_label}] [COST] Input: ${input_cost:.6f}, Output: ${output_cost:.6f}, Total: ${total_cost:.6f}")
+        log_debug(f"[SUMMARIZER] [{report_type}] [COST] Input: ${input_cost:.6f}, Output: ${output_cost:.6f}, Total: ${total_cost:.6f}")
         
         # Log to database
         log_data = {
@@ -475,10 +508,11 @@ def _execute_openai_request(prompt, model, max_tokens, section_names, documents,
             'processing_time': elapsed,
             'chrClientIntDocIds': client_int_doc_ids,
             'chrJournalDocIds': journal_doc_ids,
-            'intInternalDocId': internal_doc_id
+            'intInternalDocId': internal_doc_id,
+            'chrReportType': report_type
         }
         log_to_database(log_data)
-        log_debug(f"[SUMMARIZER] [{report_label}] Database logging completed")
+        log_debug(f"[SUMMARIZER] [{report_type}] Database logging completed")
         
         return {
             'section_bullets': section_bullets,
@@ -492,9 +526,9 @@ def _execute_openai_request(prompt, model, max_tokens, section_names, documents,
         }
         
     except Exception as e:
-        log_debug(f"[SUMMARIZER] [{report_label}] [ERROR] Error: {e}")
+        log_debug(f"[SUMMARIZER] [{report_type}] [ERROR] Error: {e}")
         import traceback
-        log_debug(f"[SUMMARIZER] [{report_label}] [ERROR] Traceback:\n{traceback.format_exc()}")
+        log_debug(f"[SUMMARIZER] [{report_type}] [ERROR] Traceback:\n{traceback.format_exc()}")
         
         # Return empty dict (no sections)
         return {

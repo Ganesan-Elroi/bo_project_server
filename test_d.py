@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 POST Method Handler for AI Summary Generation - IIS COMPATIBLE VERSION
-WITH UNMAPPED SECTION HANDLING
+WITH UNMAPPED SECTION HANDLING AND TEMPLATE FALLBACK
 """
 
 import sys
@@ -24,7 +24,7 @@ try:
     from convert_html_to_text import html_to_text, get_text_summary_info
     from openai_summarizer_bullets import process_documents_bullets
     
-    # ===== ADD FILE PROCESSING IMPORTS =====
+    # ===== FILE PROCESSING IMPORTS =====
     from extractors.file_processor import process_file
     from concurrent.futures import ThreadPoolExecutor, as_completed
     
@@ -32,6 +32,10 @@ try:
     from utils.template_analyzer import analyze_template
     from utils.template_mapper import map_bullets_to_template
     from utils.openai_summarizer_with_template import generate_section_specific_summaries, generate_content_for_unmapped_sections
+
+    from utils.template_analyzer_vardplan import analyze_vardplan_template
+    from utils.template_mapper_vardplan import map_vardplan_bullets
+    from utils.content_summarizer_vardplan import summarize_vardplan_content
 except ImportError as e:
     SUCCESSFUL_IMPORTS = False
     IMPORT_ERROR_MSG = str(e)
@@ -96,7 +100,7 @@ def read_post_data():
         post_data_raw = sys.stdin.buffer.read(content_length)
         post_data_str = post_data_raw.decode('utf-8')
         log_debug(f"[READ_POST] Read {len(post_data_str)} bytes")
-        log_debug(f"[READ_POST] Received Data :  {post_data_str} ")
+        log_debug(f"[READ_POST] Received Data: {post_data_str}")
     except Exception as e:
         log_debug(f"[ERROR] Failed to read stdin: {e}")
         return_json({"success": False, "error": "Failed to read POST data"}, 400)
@@ -108,7 +112,7 @@ def read_post_data():
     # Parse JSON
     try:
         data = json.loads(post_data_str)
-        log_debug("[INFO] POST data parsed successfully. Received Data ", data)
+        log_debug("[INFO] POST data parsed successfully. Received Data:", data)
         return data
     except json.JSONDecodeError as e:
         log_debug(f"[ERROR] JSON decode error: {str(e)}")
@@ -124,7 +128,7 @@ def is_html_content(content):
     if any(indicator in content_lower for indicator in html_indicators):
         return True
     
-    # ===== ADD FILE DETECTION =====
+    # ===== FILE DETECTION =====
     file_extensions = ['.pdf', '.docx', '.doc', '.jpg', '.jpeg', '.png', '.gif']
     if any(content_lower.endswith(ext) for ext in file_extensions):
         return False
@@ -172,7 +176,6 @@ def execute_sql_query(sql_query):
         raise Exception(f"Database error: {str(e)}")
 
 def process_single_file(doc, base_path, ocr_language):
-    log_debug(f"process single file function calling... base path {base_path}")
     """Process a single file document"""
     try:
         log_debug(f"[FILE_PROCESS] Processing file: {doc['name']}")
@@ -208,34 +211,71 @@ def process_single_file(doc, base_path, ocr_language):
 
 def find_unmapped_sections(template_sections, mapped_sections):
     """
-    Find template sections that were not mapped
+    Find template sections that were not mapped or have placeholder content
     
     Args:
         template_sections (list): All template section names
-        mapped_sections (dict): Sections that were successfully mapped
+        mapped_sections (dict): Sections that were returned by AI
         
     Returns:
         list: Section names that need content
     """
     unmapped = []
     
+    # Define placeholder texts that indicate empty/missing content
+    placeholder_texts = [
+        '', 
+        'information saknas', 
+        'information missing',
+        'information saknas i dokumenten',
+        'ingen information', 
+        'no information', 
+        'saknas', 
+        'missing',
+        'n/a', 
+        'none', 
+        'nej', 
+        'no'
+    ]
+    
     for template_section in template_sections:
         # Normalize for comparison
         template_normalized = re.sub(r'\s+', ' ', template_section.lower().strip())
         
-        # Check if this section was mapped
+        # Check if this section exists in mapped_sections
         found = False
-        for mapped_section in mapped_sections.keys():
+        has_real_content = False
+        
+        for mapped_section, bullets in mapped_sections.items():
             mapped_normalized = re.sub(r'\s+', ' ', mapped_section.lower().strip())
+            
+            # Check if this is a match
             if template_normalized == mapped_normalized or \
                template_normalized in mapped_normalized or \
                mapped_normalized in template_normalized:
                 found = True
+                
+                # Check if bullets have real content (not just placeholders)
+                if bullets:
+                    for bullet in bullets:
+                        bullet_text = str(bullet).strip().lower()
+                        if bullet_text and bullet_text not in placeholder_texts:
+                            has_real_content = True
+                            break
+                
                 break
         
+        # Section needs content if:
+        # 1. Not found in mapped sections at all, OR
+        # 2. Found but only has placeholder content
         if not found:
             unmapped.append(template_section)
-            log_debug(f"[UNMAPPED_CHECK] Section not mapped: '{template_section}'")
+            log_debug(f"[UNMAPPED_CHECK] Section missing from AI response: '{template_section}'")
+        elif not has_real_content:
+            unmapped.append(template_section)
+            log_debug(f"[UNMAPPED_CHECK] Section has placeholder content only: '{template_section}'")
+        else:
+            log_debug(f"[UNMAPPED_CHECK] Section OK: '{template_section}' ({len(bullets)} bullets)")
     
     return unmapped
 
@@ -264,26 +304,26 @@ def main():
         openai_model = data.get('openai_model', 'gpt-4o-mini')
         max_tokens = data.get('max_tokens', 6000)
         
-        # ===== ADD FILE PROCESSING PARAMETERS =====
+        # ===== FILE PROCESSING PARAMETERS =====
         client_int_doc_ids = data.get('client_int_doc_ids', None)
         journal_doc_ids = data.get('journal_doc_ids', None)
         internal_doc_id = data.get('internal_doc_id', None)
         
         ip_address = os.environ.get('REMOTE_ADDR', '0.0.0.0')
         cust_code = data.get('cust_code')
-        report_type= data.get('report_type' , 'SlutReport')
+        report_type = data.get('report_type', 'SlutReport')
+        client_name = data.get('client_name', None)
+        client_pnr = data.get('client_pnr', None)
         
-        log_debug("Report Type --->", report_type)
-        # ===== ADD BASE PATH CONFIGURATION =====
+        log_debug(f"[PARAMS] Report Type: {report_type}")
         
+        # ===== BASE PATH CONFIGURATION =====
         ocr_language = 'swe'
         
         if cust_code:
             base_path = f"D:/inetpub/Js/Customer/{cust_code}/Client Documents"
-
         else:   
             base_path = ""
-
 
         log_debug(f"[PARAMS] User: {user_id}, Customer: {cust_id}, Client: {client_id}")
         log_debug(f"[PARAMS] Model: {openai_model}, IP: {ip_address}")
@@ -311,7 +351,7 @@ def main():
         log_debug("[STEP 2] Processing documents")
         processed_documents = []
         html_docs = []
-        file_docs = []  # ===== ADD FILE DOCS LIST =====
+        file_docs = []
         
         for idx, record in enumerate(db_results, 1):
             doc_content = record.get('DocumentContent', '')
@@ -324,7 +364,6 @@ def main():
                     'record': record, 'type': doc_type
                 })
             else:
-                # ===== ADD FILE DOCS PROCESSING =====
                 file_docs.append({
                     'index': idx, 'name': doc_name, 'content': doc_content,
                     'record': record, 'type': doc_type
@@ -349,7 +388,7 @@ def main():
                 })
                 log_debug(f"[HTML_PROCESS] {doc['name']} - {text_info['word_count']} words")
         
-        # ===== ADD FILE DOCUMENTS PROCESSING =====
+        # ===== FILE DOCUMENTS PROCESSING =====
         if file_docs:
             log_debug(f"[STEP 2B] Processing {len(file_docs)} file documents")
             
@@ -385,7 +424,7 @@ def main():
         
         # TEMPLATE MODE
         if doc_template_query:
-            log_debug("[MODE] TEMPLATE MODE")
+            log_debug("[MODE] TEMPLATE MODE REQUESTED")
             
             template_results = execute_sql_query(doc_template_query)
             if not template_results:
@@ -398,6 +437,7 @@ def main():
                 return_json({"success": False, "error": "Template HTML empty"}, 400)
             
             log_debug("[STEP 3] Analyzing template")
+            
             # Route based on report_type
             if report_type == "Månadsrapport":
                 # Use MONTHLY files
@@ -408,69 +448,21 @@ def main():
                 template_structure = analyze_monthly_template(template_html)
                 section_names = [s['name'] for s in template_structure['sections']]
                 
-                log_debug(f"[STEP 4] Generating MONTHLY summaries for {len(section_names)} sections")
-                ai_result = generate_monthly_summaries(
-                    documents=processed_documents,
-                    section_names=section_names,
-                    model=openai_model,
-                    max_tokens=max_tokens,
-                    ip_address=ip_address,
-                    client_int_doc_ids=client_int_doc_ids,
-                    journal_doc_ids=journal_doc_ids,
-                    internal_doc_id=internal_doc_id,
-                    client_id=client_id,
-                    cust_id=cust_id,
-                    user_id=user_id
-                )
-                
-                section_bullets = ai_result['section_bullets']
-                
-                log_debug("[STEP 5] Mapping bullets to MONTHLY template")
-                filled_template_html = map_monthly_bullets(
-                    template_html=template_html,
-                    section_bullets=section_bullets,
-                    template_structure=template_structure
-                )
-
-            else:
-                # Use SLUTRAPPORT files
-                from utils.template_analyzer import analyze_template
-                from utils.template_mapper import map_bullets_to_template
-                from utils.openai_summarizer_with_template import generate_section_specific_summaries, generate_content_for_unmapped_sections
-                
-                template_structure = analyze_template(template_html)
-                section_names = [s['name'] for s in template_structure['sections']]
-                
-                log_debug(f"[STEP 4] Generating SLUTRAPPORT summaries for {len(section_names)} sections")
-                ai_result = generate_section_specific_summaries(
-                    documents=processed_documents,
-                    section_names=section_names,
-                    model=openai_model,
-                    max_tokens=max_tokens,
-                    ip_address=ip_address,
-                    client_int_doc_ids=client_int_doc_ids,
-                    journal_doc_ids=journal_doc_ids,
-                    internal_doc_id=internal_doc_id,
-                    client_id=client_id,
-                    cust_id=cust_id,
-                    user_id=user_id,
-                    report_type=report_type
-                )
-                
-                section_bullets = ai_result['section_bullets']
-                
-                # ===== NEW: CHECK FOR UNMAPPED SECTIONS =====
-                log_debug(f"[STEP 4.5] Checking for unmapped sections")
-                unmapped_sections = find_unmapped_sections(section_names, section_bullets)
-                
-                if unmapped_sections:
-                    log_debug(f"[STEP 4.5] Found {len(unmapped_sections)} unmapped sections, generating content...")
+                # ===== CRITICAL: CHECK IF TEMPLATE ANALYZER FOUND SECTIONS =====
+                if not section_names or len(section_names) == 0:
+                    log_debug("[WARNING] Template analyzer found 0 sections!")
+                    log_debug("[WARNING] Falling back to NON-TEMPLATE MODE (Dynamic Headers)")
+                    log_debug("[WARNING] Template may have unsupported format")
                     
-                    unmapped_result = generate_content_for_unmapped_sections(
-                        unmapped_sections=unmapped_sections,
+                    # Fall through to non-template mode at the end
+                    doc_template_query = None
+                else:
+                    log_debug(f"[STEP 4] Generating MONTHLY summaries for {len(section_names)} sections")
+                    ai_result = generate_monthly_summaries(
                         documents=processed_documents,
+                        section_names=section_names,
                         model=openai_model,
-                        max_tokens=2000,
+                        max_tokens=max_tokens,
                         ip_address=ip_address,
                         client_int_doc_ids=client_int_doc_ids,
                         journal_doc_ids=journal_doc_ids,
@@ -478,68 +470,378 @@ def main():
                         client_id=client_id,
                         cust_id=cust_id,
                         user_id=user_id,
-                        report_type="SLUTRAPPORT"
+                        report_type=report_type, client_name= client_name, client_pnr = client_pnr
                     )
                     
-                    # Merge unmapped content with original
-                    unmapped_bullets = unmapped_result['section_bullets']
-                    section_bullets.update(unmapped_bullets)
-                    
-                    # Update costs
-                    ai_result['tokens'] += unmapped_result['tokens']
-                    ai_result['input_tokens'] += unmapped_result['input_tokens']
-                    ai_result['output_tokens'] += unmapped_result['output_tokens']
-                    ai_result['time'] += unmapped_result['time']
-                    ai_result['input_cost'] += unmapped_result['input_cost']
-                    ai_result['output_cost'] += unmapped_result['output_cost']
-                    ai_result['total_cost'] += unmapped_result['total_cost']
-                    
-                    log_debug(f"[STEP 4.5] Merged {len(unmapped_bullets)} unmapped sections")
-                else:
-                    log_debug(f"[STEP 4.5] All sections mapped successfully")
-                
-                log_debug("[STEP 5] Mapping bullets to SLUTRAPPORT template")
-                filled_template_html = map_bullets_to_template(
-                    template_html=template_html,
-                    section_bullets_dict=section_bullets,
-                    template_structure=template_structure
-                )
+                    section_bullets = ai_result['section_bullets']
+                    # New code
+                    # FILTER: Remove any sections not in template
+                    filtered_bullets = {}
+                    for bullet_section, bullets in section_bullets.items():
+                        # Check if this section exists in template
+                        if bullet_section in section_names:
+                            filtered_bullets[bullet_section] = bullets
+                        else:
+                            log_debug(f"[FILTER] Removed non-template section: '{bullet_section}'")
 
-            
-            response = {
-                "success": True,
-                "user_id": user_id,
-                "cust_id": cust_id,
-                "client_id": client_id,
-                "template_mode": True,
-                "filled_template_html": filled_template_html,
-                "section_bullets": section_bullets,
-                "template_info": {
-                    "type": template_structure['template_type'],
-                    "sections_detected": len(section_names),
-                    "sections_mapped": len(section_bullets)
-                },
-                "document_counts": {
-                    "total": len(db_results),
-                    "html_docs": len(html_docs),
-                    "file_docs": len(file_docs)  # ===== ADD FILE DOCS COUNT =====
-                },
-                "ai_usage": {
-                    "tokens": ai_result.get('tokens', 0),
-                    "processing_time": ai_result.get('time', 0),
-                    "input_cost": ai_result.get('input_cost', 0),
-                    "output_cost": ai_result.get('output_cost', 0),
-                    "total_cost": ai_result.get('total_cost', 0)
-                }
-            }
-            
-            log_debug("[SUCCESS] Template mode completed")
-            return_json(response)
-            
-        else:
-            # BULLET MODE
-            log_debug("[MODE] BULLET MODE")
-            
+                    section_bullets = filtered_bullets
+                    # New code end
+                    
+                    # Check for unmapped sections
+                    log_debug(f"[STEP 4.5] Checking for unmapped MONTHLY sections")
+                    unmapped_sections = find_unmapped_sections(section_names, section_bullets)
+                    
+                    if unmapped_sections:
+                        log_debug(f"[STEP 4.5] Found {len(unmapped_sections)} unmapped MONTHLY sections")
+                        from utils.openai_summarizer_with_template_monthly import generate_content_for_unmapped_monthly_sections
+                        
+                        unmapped_result = generate_content_for_unmapped_monthly_sections(
+                            unmapped_sections=unmapped_sections,
+                            documents=processed_documents,
+                            model=openai_model,
+                            max_tokens=max_tokens,
+                            ip_address=ip_address,
+                            client_int_doc_ids=client_int_doc_ids,
+                            journal_doc_ids=journal_doc_ids,
+                            internal_doc_id=internal_doc_id,
+                            client_id=client_id,
+                            cust_id=cust_id,
+                            user_id=user_id,
+                            report_type=report_type, client_name= client_name, client_pnr = client_pnr
+                        )
+                        
+                        unmapped_bullets = unmapped_result['section_bullets']
+                        section_bullets.update(unmapped_bullets)
+                        
+                        # Update costs
+                        ai_result['tokens'] += unmapped_result['tokens']
+                        ai_result['input_tokens'] += unmapped_result['input_tokens']
+                        ai_result['output_tokens'] += unmapped_result['output_tokens']
+                        ai_result['time'] += unmapped_result['time']
+                        ai_result['input_cost'] += unmapped_result['input_cost']
+                        ai_result['output_cost'] += unmapped_result['output_cost']
+                        ai_result['total_cost'] += unmapped_result['total_cost']
+                        
+                        log_debug(f"[STEP 4.5] Merged {len(unmapped_bullets)} unmapped MONTHLY sections")
+                    
+                    log_debug("[STEP 5] Mapping bullets to MONTHLY template")
+                    filled_template_html = map_monthly_bullets(
+                        template_html=template_html,
+                        section_bullets=section_bullets,
+                        template_structure=template_structure
+                    )
+                    
+                    # Build response
+                    response = {
+                        "success": True,
+                        "user_id": user_id,
+                        "cust_id": cust_id,
+                        "client_id": client_id,
+                        "template_mode": True,
+                        "filled_template_html": filled_template_html,
+                        "section_bullets": section_bullets,
+                        "template_info": {
+                            "type": template_structure['template_type'],
+                            "sections_detected": len(section_names),
+                            "sections_mapped": len(section_bullets),
+                            "all_sections_filled": len(section_bullets) == len(section_names)
+                        },
+                        "document_counts": {
+                            "total": len(db_results),
+                            "html_docs": len(html_docs),
+                            "file_docs": len(file_docs)
+                        },
+                        "ai_usage": {
+                            "tokens": ai_result.get('tokens', 0),
+                            "processing_time": ai_result.get('time', 0),
+                            "input_cost": ai_result.get('input_cost', 0),
+                            "output_cost": ai_result.get('output_cost', 0),
+                            "total_cost": ai_result.get('total_cost', 0)
+                        }
+                    }
+                    
+                    log_debug("[SUCCESS] Monthly template mode completed")
+                    log_debug(f"[SUCCESS] Final stats: {len(section_bullets)}/{len(section_names)} sections filled")
+                    return_json(response)
+                    
+            # ===== ADD THIS NEW VÅRDPLAN BLOCK HERE =====
+            elif report_type == "Genomförandeplan":
+                log_debug("[MODE] VÅRDPLAN/Genomförandeplan TEMPLATE MODE")
+                
+                # Analyze template
+                template_structure = analyze_vardplan_template(template_html)
+                section_names = [s['name'] for s in template_structure['sections']]
+                
+                if not section_names or len(section_names) == 0:
+                    log_debug("[WARNING] Vårdplan/Genomförandeplan template analyzer found 0 sections!")
+                    log_debug("[WARNING] Falling back to NON-TEMPLATE MODE")
+                    doc_template_query = None
+                else:
+                    log_debug(f"[STEP 4] Generating VÅRDPLAN summaries for {len(section_names)} sections")
+                    
+                    # Generate summaries (NOW RETURNS FULL RESULT WITH STATS)
+                    ai_result = summarize_vardplan_content(
+                        journal_entries=[{
+                            'content': doc['text'],
+                            'date': doc.get('created_date', 'Unknown')
+                        } for doc in processed_documents],
+                        template_sections=section_names,
+                        model=openai_model,
+                        max_tokens=max_tokens,
+                        ip_address=ip_address,
+                        client_int_doc_ids=client_int_doc_ids,
+                        journal_doc_ids=journal_doc_ids,
+                        internal_doc_id=internal_doc_id,
+                        client_id=client_id,
+                        cust_id=cust_id,
+                        user_id=user_id,
+                        report_type=report_type
+                    )
+                    
+                    section_bullets = ai_result['section_bullets']
+                    # New code
+                    # FILTER: Remove any sections not in template
+                    filtered_bullets = {}
+                    for bullet_section, bullets in section_bullets.items():
+                        # Check if this section exists in template
+                        if bullet_section in section_names:
+                            filtered_bullets[bullet_section] = bullets
+                        else:
+                            log_debug(f"[FILTER] Removed non-template section: '{bullet_section}'")
+
+                    section_bullets = filtered_bullets
+                    # New code end
+                    
+                    # Check for unmapped sections
+                    log_debug(f"[STEP 4.5] Checking for unmapped VÅRDPLAN sections")
+                    unmapped_sections = find_unmapped_sections(section_names, section_bullets)
+                    
+                    if unmapped_sections:
+                        log_debug(f"[STEP 4.5] Found {len(unmapped_sections)} unmapped VÅRDPLAN sections")
+                        
+                        # Generate content for unmapped sections
+                        unmapped_result = summarize_vardplan_content(
+                            journal_entries=[{
+                                'content': doc['text'],
+                                'date': doc.get('created_date', 'Unknown')
+                            } for doc in processed_documents],
+                            template_sections=unmapped_sections,
+                            model=openai_model,
+                            max_tokens=max_tokens,
+                            ip_address=ip_address,
+                            client_int_doc_ids=client_int_doc_ids,
+                            journal_doc_ids=journal_doc_ids,
+                            internal_doc_id=internal_doc_id,
+                            client_id=client_id,
+                            cust_id=cust_id,
+                            user_id=user_id
+                        )
+                        
+                        # Merge results
+                        unmapped_bullets = unmapped_result['section_bullets']
+                        section_bullets.update(unmapped_bullets)
+                        
+                        # Update costs
+                        ai_result['tokens'] += unmapped_result['tokens']
+                        ai_result['input_tokens'] += unmapped_result['input_tokens']
+                        ai_result['output_tokens'] += unmapped_result['output_tokens']
+                        ai_result['time'] += unmapped_result['time']
+                        ai_result['input_cost'] += unmapped_result['input_cost']
+                        ai_result['output_cost'] += unmapped_result['output_cost']
+                        ai_result['total_cost'] += unmapped_result['total_cost']
+                        
+                        log_debug(f"[STEP 4.5] Merged {len(unmapped_bullets)} unmapped sections")
+                    
+                    # Map bullets to template
+                    log_debug("[STEP 5] Mapping bullets to VÅRDPLAN template")
+                    filled_template_html = map_vardplan_bullets(
+                        template_html=template_html,
+                        section_bullets=section_bullets,
+                        template_structure=template_structure
+                    )
+                    
+                    # Build response
+                    response = {
+                        "success": True,
+                        "user_id": user_id,
+                        "cust_id": cust_id,
+                        "client_id": client_id,
+                        "template_mode": True,
+                        "filled_template_html": filled_template_html,
+                        "section_bullets": section_bullets,
+                        "template_info": {
+                            "type": template_structure['template_type'],
+                            "sections_detected": len(section_names),
+                            "sections_mapped": len(section_bullets),
+                            "all_sections_filled": len(section_bullets) == len(section_names)
+                        },
+                        "document_counts": {
+                            "total": len(db_results),
+                            "html_docs": len(html_docs),
+                            "file_docs": len(file_docs)
+                        },
+                        "ai_usage": {
+                            "tokens": ai_result.get('tokens', 0),
+                            "processing_time": ai_result.get('time', 0),
+                            "input_cost": ai_result.get('input_cost', 0),
+                            "output_cost": ai_result.get('output_cost', 0),
+                            "total_cost": ai_result.get('total_cost', 0)
+                        }
+                    }
+                    
+                    log_debug("[SUCCESS] Vårdplan template mode completed")
+                    log_debug(f"[SUCCESS] Final stats: {len(section_bullets)}/{len(section_names)} sections filled")
+                    return_json(response)
+      
+
+            else:
+                # Use Slutrapport files (default)
+                from utils.template_analyzer import analyze_template
+                from utils.template_mapper import map_bullets_to_template
+                from utils.openai_summarizer_with_template import generate_section_specific_summaries, generate_content_for_unmapped_sections
+                
+                template_structure = analyze_template(template_html)
+                section_names = [s['name'] for s in template_structure['sections']]
+                
+                # ===== CRITICAL: CHECK IF TEMPLATE ANALYZER FOUND SECTIONS =====
+                if not section_names or len(section_names) == 0:
+                    log_debug("[WARNING] Template analyzer found 0 sections!")
+                    log_debug("[WARNING] Falling back to NON-TEMPLATE MODE (Dynamic Headers)")
+                    log_debug("[WARNING] Template may have unsupported format or missing <strong> tags")
+                    
+                    # Fall through to non-template mode at the end
+                    doc_template_query = None
+                else:
+                    log_debug(f"[STEP 4] Generating Slutrapport summaries for {len(section_names)} sections")
+                    log_debug(f"[STEP 4] Section names: {section_names}")
+                    
+                    ai_result = generate_section_specific_summaries(
+                        documents=processed_documents,
+                        section_names=section_names,
+                        model=openai_model,
+                        max_tokens=max_tokens,
+                        ip_address=ip_address,
+                        client_int_doc_ids=client_int_doc_ids,
+                        journal_doc_ids=journal_doc_ids,
+                        internal_doc_id=internal_doc_id,
+                        client_id=client_id,
+                        cust_id=cust_id,
+                        user_id=user_id,
+                        report_type=report_type
+                    )
+                    
+                    section_bullets = ai_result['section_bullets']
+                    # New code
+                    # FILTER: Remove any sections not in template
+                    filtered_bullets = {}
+                    for bullet_section, bullets in section_bullets.items():
+                        # Check if this section exists in template
+                        if bullet_section in section_names:
+                            filtered_bullets[bullet_section] = bullets
+                        else:
+                            log_debug(f"[FILTER] Removed non-template section: '{bullet_section}'")
+
+                    section_bullets = filtered_bullets
+                    # New code end
+                    log_debug(f"[STEP 4] AI returned {len(section_bullets)} sections")
+                    log_debug(f"[STEP 4] Sections returned: {list(section_bullets.keys())}")
+                    
+                    # Check for unmapped sections
+                    log_debug(f"[STEP 4.5] Checking for unmapped sections...")
+                    unmapped_sections = find_unmapped_sections(section_names, section_bullets)
+                    
+                    if unmapped_sections:
+                        log_debug(f"[STEP 4.5] Found {len(unmapped_sections)} unmapped sections: {unmapped_sections}")
+                        log_debug(f"[STEP 4.5] Generating content for unmapped sections...")
+                        
+                        unmapped_result = generate_content_for_unmapped_sections(
+                            unmapped_sections=unmapped_sections,
+                            documents=processed_documents,
+                            model=openai_model,
+                            max_tokens=max_tokens,
+                            ip_address=ip_address,
+                            client_int_doc_ids=client_int_doc_ids,
+                            journal_doc_ids=journal_doc_ids,
+                            internal_doc_id=internal_doc_id,
+                            client_id=client_id,
+                            cust_id=cust_id,
+                            user_id=user_id,
+                            report_type=report_type
+                        )
+                        
+                        unmapped_bullets = unmapped_result['section_bullets']
+                        log_debug(f"[STEP 4.5] Unmapped API returned {len(unmapped_bullets)} sections")
+                        
+                        for section, bullets in unmapped_bullets.items():
+                            log_debug(f"[STEP 4.5] Merging '{section}' with {len(bullets)} bullets")
+                            section_bullets[section] = bullets
+                        
+                        # Update costs
+                        ai_result['tokens'] += unmapped_result['tokens']
+                        ai_result['input_tokens'] += unmapped_result['input_tokens']
+                        ai_result['output_tokens'] += unmapped_result['output_tokens']
+                        ai_result['time'] += unmapped_result['time']
+                        ai_result['input_cost'] += unmapped_result['input_cost']
+                        ai_result['output_cost'] += unmapped_result['output_cost']
+                        ai_result['total_cost'] += unmapped_result['total_cost']
+                        
+                        log_debug(f"[STEP 4.5] Successfully merged {len(unmapped_bullets)} unmapped sections")
+                        log_debug(f"[STEP 4.5] Total sections now: {len(section_bullets)}")
+                    else:
+                        log_debug(f"[STEP 4.5] All {len(section_names)} sections mapped successfully!")
+                    
+                    log_debug("[STEP 5] Mapping bullets to Slutrapport template")
+                    log_debug(f"[STEP 5] Mapping {len(section_bullets)} sections to template")
+                    
+                    filled_template_html = map_bullets_to_template(
+                        template_html=template_html,
+                        section_bullets_dict=section_bullets,
+                        template_structure=template_structure
+                    )
+                    
+                    log_debug("[STEP 5] Template mapping completed")
+                    
+                    # Build response
+                    response = {
+                        "success": True,
+                        "user_id": user_id,
+                        "cust_id": cust_id,
+                        "client_id": client_id,
+                        "template_mode": True,
+                        "filled_template_html": filled_template_html,
+                        "section_bullets": section_bullets,
+                        "template_info": {
+                            "type": template_structure['template_type'],
+                            "sections_detected": len(section_names),
+                            "sections_mapped": len(section_bullets),
+                            "all_sections_filled": len(section_bullets) == len(section_names)
+                        },
+                        "document_counts": {
+                            "total": len(db_results),
+                            "html_docs": len(html_docs),
+                            "file_docs": len(file_docs)
+                        },
+                        "ai_usage": {
+                            "tokens": ai_result.get('tokens', 0),
+                            "processing_time": ai_result.get('time', 0),
+                            "input_cost": ai_result.get('input_cost', 0),
+                            "output_cost": ai_result.get('output_cost', 0),
+                            "total_cost": ai_result.get('total_cost', 0)
+                        }
+                    }
+                    
+                    log_debug("[SUCCESS] Template mode completed")
+                    log_debug(f"[SUCCESS] Final stats: {len(section_bullets)}/{len(section_names)} sections filled")
+                    return_json(response)
+        
+        # ===== NON-TEMPLATE MODE (FALLBACK OR EXPLICIT) =====
+        # This runs if:
+        # 1. doc_template_query was None (user didn't provide template)
+        # 2. Template analyzer found 0 sections (automatic fallback)
+        
+        if not doc_template_query:
+            log_debug("[MODE] BULLET MODE - Dynamic Headers")
+
             analysis_results = process_documents_bullets(
                 processed_documents,
                 chunk_size=5,
@@ -551,13 +853,14 @@ def main():
                 internal_doc_id=internal_doc_id,
                 client_id=client_id,
                 cust_id=cust_id,
-                user_id=user_id
+                user_id=user_id,
+                report_type=report_type
             )
-            
+
             if analysis_results.get('status') == 'error':
                 log_debug(f"[ERROR] AI processing failed: {analysis_results.get('error')}")
                 return_json({"success": False, "error": analysis_results.get('error')}, 500)
-            
+
             response = {
                 "success": True,
                 "user_id": user_id,
@@ -567,9 +870,12 @@ def main():
                 "document_counts": {
                     "total": len(db_results),
                     "html_docs": len(html_docs),
-                    "file_docs": len(file_docs)  # ===== ADD FILE DOCS COUNT =====
+                    "file_docs": len(file_docs)
                 },
-                "summary": analysis_results.get('bullet_summaries', []),
+                "organized_summary": analysis_results.get('organized_summary', []),
+                "html_output": analysis_results.get('html_output', ''),
+                "section_count": analysis_results.get('section_count', 0),
+                "bullet_count": analysis_results.get('bullet_count', 0),
                 "ai_usage": {
                     "tokens": analysis_results.get('tokens', 0),
                     "processing_time": analysis_results.get('time', 0),
@@ -578,8 +884,8 @@ def main():
                     "total_cost": analysis_results.get('total_cost', 0)
                 }
             }
-            
-            log_debug("[SUCCESS] Bullet mode completed")
+
+            log_debug("[SUCCESS] Bullet mode with dynamic headers completed")
             return_json(response)
 
     except Exception as e:
